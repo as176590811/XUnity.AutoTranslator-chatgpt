@@ -199,6 +199,7 @@ def translate():
     translation = translation_queue.get()
 
     if translation:
+         translation=translation.replace('\\n','\n')  
          return f"{translation}"
     else:
          return "翻译失败", 500
