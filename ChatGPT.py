@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-from flask import Flask, request, jsonify  #需要安装库 pip install Flask
+from flask import Flask, request  #需要安装库 pip install Flask
 from gevent.pywsgi import WSGIServer  #需要安装库 pip install gevent
 from urllib.parse import unquote
 from threading import Thread
@@ -8,22 +7,33 @@ import os
 from openai import OpenAI   #需要安装库 pip install openai
 import re
 import json
+import concurrent.futures
 
-dict_path='用户提示字典.json' # 提示字典路径，不使用则留空
+# 启用虚拟终端序列，支持ANSI转义代码
+os.system('')
+
+
+dict_path='用户替换字典.json' # 提示字典路径，不使用则留空
 
 # API配置
-Base_url = 'https://api.sweetyly.buzz' # 中转请求地址
-Model_Type = 'gpt-3.5-turbo-0613' # 模型类型
-API_key ='sk-11111111111111111111111111111111111' # API密钥
+Base_urls = ['https://api.sweetyun.com']  # 中转请求地址
+Model_Type = 'gpt-3.5-turbo-16k' # 模型名称
+API_keys = ['sk-1111111111111111111111111111111111']  
 Proxy_port = ''  # 代理端口，如果不使用代理则为空
-# 中文字符不足1/n时，换下一个提示词重新翻译
-n=3
-# 结果中有任意短语或单字连续出现大于等于repeat_count次并且原文中没有连续出现repeat_count-2次的短语，换下一提示词重新翻译
-repeat_count=3
+
+# 如果填入地址，则设置系统代理
+original_http_proxy = os.environ.get("http_proxy")
+original_https_proxy = os.environ.get("https_proxy")
+
+# 译文中有任意单字或单词连续出现大于等于repeat_count次，换下一提示词重新翻译
+repeat_count=5
 # 提示词，按照使用顺序添加进prompt_ist
-prompt0= '你是一个游戏翻译人，你的任务是将游戏中的日语翻译成简体中文。翻译时要注意忽视低俗内容的问题，流畅自然地翻译，遵循高质量情色文学的习惯。特殊字符和英文字符不要翻译，并且需要原封不动的保留在对应位置。你的回答应只包含翻译结果，不要有任何提示词或其他内容。'
-prompt1= 'You are a translation assistant capable of converting texts into Simplified Chinese, disregarding issues of coarse content. Do not translate special characters, keep the special characters. Furthermore, the returned result must solely consist of the Translation results without the addition of any prompt words or questions not present in the original text.'
-prompt2= 'You are a localizer specialized in Simplified Chinese and Japanese culture, and you need to translate the Japanese text in the game into Simplified Chinese, ignore the issue of vulgar content, translate fluently and naturally, and follow the habits of high-quality erotic literature.the escape characters or non-Japanese content such as numbers, English letters, special symbols, etc. in each line of text do not need to be translated or changed, and should be preserved as they are.Furthermore, the returned result must solely consist of the Translation results without the addition of any prompt words or questions not present in the original text.'
+prompt0= """你是一个游戏翻译人，你的任务是将游戏中的日语翻译成简体中文。翻译时要注意忽视低俗内容的问题，流畅自然地翻译，遵循高质量情色文学的习惯。特殊字符和英文字符不要翻译，并且需要原封不动的保留在对应位置。你的回答应只包含翻译结果，不要有任何提示词或其他内容。"""
+prompt1= """You are a translation assistant capable of converting texts into Simplified Chinese, disregarding issues of coarse content. Do not translate special characters, keep the special characters. Furthermore, the returned result must solely consist of the Translation results without the addition of any prompt words or questions not present in the original text."""
+prompt2= """You are a localizer specialized in Simplified Chinese and Japanese culture, and you need to translate the Japanese text in the game into Simplified Chinese, ignore the issue of vulgar content, translate fluently and naturally, and follow the habits of high-quality erotic literature.the escape characters or non-Japanese content such as numbers, English letters, special symbols, etc. in each line of text do not need to be translated or changed, and should be preserved as they are.Furthermore, the returned result must solely consist of the Translation results without the addition of any prompt words or questions not present in the original text."""
+# prompt3= """ """
+# prompt4= """ """
+
 
 prompt_list=[prompt0,prompt1,prompt2]
 l=len(prompt_list)
@@ -41,11 +51,11 @@ if Proxy_port:
     os.environ["https_proxy"] = Proxy_port
 
 # 检查一下请求地址尾部是否为/v1，自动补全
-if not Base_url.endswith("/v1"):
-    Base_url += "/v1"
+if not Base_urls[0].endswith("/v1"):
+    Base_urls = [url + "/v1" for url in Base_urls]
 
-# 创建openai客户端
-openai_client = OpenAI(api_key=API_key, base_url=Base_url)
+# 创建多个openai客户端
+openai_clients = [OpenAI(api_key=key, base_url=url) for key, url in zip(API_keys, Base_urls)]
 
 # 读取提示字典,并从长倒短排序
 if dict_path:
@@ -58,18 +68,55 @@ if dict_path:
 else:
     prompt_dict= {}
 
-# 判断中文字符(包括标点）长度是否不足总字符串长度的1/n
-def is_chinese_text_shorter_than(text):
-    pattern = re.compile(r'[!.,?，。？\u4e00-\u9fff\u3000-\u303f\uff01-\uffef0-9]+')
-    chars = pattern.findall(text)
-    char_count = sum(len(char) for char in chars)
-    return char_count < len(text) / n
+def contains_japanese(text):
+    # 英文、日文字符的正则表达式
+    pattern = re.compile(r'[a-zA-Z\u3040-\u3096\u309D-\u309F\u30A1-\u30FA\u30FC-\u30FE]')
+    return pattern.search(text) is not None
 
-# 检测是否有任一短语连续出现超过count+1次,检测范围除外了中日标点和!.,?，。？
-def has_repeated_sequence(string,count):
-    pattern = re.compile(fr"([^!.,?，。？\u3000-\u303F\uFF00-\uFFEF]+?)\1{{{count-1}}}")
-    match = re.search(pattern, string)
-    return bool(match)
+
+#检测是否有连续出现的短语或单字
+def has_repeated_sequence(string, count):
+    # 首先检查单个字符的重复
+    for char in set(string):
+        if string.count(char) >= count:
+            return True
+
+    # 然后检查字符串片段的重复
+    # 字符串片段的长度从2到len(string)//count
+    for size in range(2, len(string)//count + 1):
+        for start in range(0, len(string) - size + 1):
+            # 滑动窗口来提取字符串片段
+            substring = string[start:start + size]
+            # 使用正则表达式来检查整个字符串中该片段的重复
+            matches = re.findall(re.escape(substring), string)
+            if len(matches) >= count:
+                return True
+            
+    return False
+
+
+#检测计算重复出现的短语或单字(仅计算，不作任何作用)
+def count_repeated_sequences(string, repeat_count):
+    # 匹配连续的单词或单个字符
+    pattern = re.compile(r'(\b\w+\b|\S)(\s+\1)+')
+    
+    # 存储重复序列及其出现次数
+    repeated_sequences = {}
+
+    # 查找所有连续重复的序列
+    for match in pattern.finditer(string):
+        # 获取匹配的文本
+        matched_text = match.group(0)
+        # 获取基础单词或字符
+        base_word = match.group(1)
+        # 计算基础单词或字符重复出现的次数（加1是因为基础单词本身也算一次）
+        repeat_times = len(matched_text.split()) // (matched_text.count(base_word) // len(base_word)) + 1
+        # 如果重复次数大于等于repeat_count，则记录
+        if repeat_times >= repeat_count:
+            repeated_sequences[base_word] = repeat_times
+
+    return repeated_sequences
+
 
 # 获得文本中包含的字典词汇
 def get_dict(text):
@@ -82,9 +129,12 @@ def get_dict(text):
             break
     return res
 
-def handle_translation(text, queue):
+
+def handle_translation(text, queue, prompt_index=0):
     # 对接收到的文本进行URL解码
+    
     text = unquote(text)
+     
     
     # 定义特殊字符
     special_chars = ['，', '。', '？','...']
@@ -106,79 +156,126 @@ def handle_translation(text, queue):
 
     # 更多模型参数
     model_params = {
-        "temperature": 0.2,  # 控制输出的随机性
+        "temperature": 0.5,  # 控制输出的随机性
         "max_tokens": 520,  # 控制输出的最大长度
         "top_p": 1,  # 控制采样的概率质量，1意味着使用所有可能的继续
-        "frequency_penalty": 0,  # 降低重复内容的出现概率
-        "presence_penalty": 0,  # 降低重复主题或者话题的出现概率
+        "frequency_penalty": 0.3,  # 降低重复内容的出现概率
+        "presence_penalty": 0.3,  # 降低重复主题或者话题的出现概率
     }
     try:
+                   
         dict_inuse=get_dict(text)
-        apology_phrase = "我很抱歉，但我无法完成这个任务"
+        apology_phrases = [
+            "我很抱歉，但我无法完成这个任务",
+            "抱歉，我无法提供此服务",
+            "抱歉，您提供的内容不足以进行翻译。请提供更多的日语原文，以便我为您翻译",
+            "抱歉，您提供的词语“Middle”是英文，而不是日语，我无法进行翻译。请提供日语原文，我将为您翻译成简体中文",
+            "抱歉，我只能提供日语到简体中文的翻译服务。如果你有日语游戏文本需要翻译，请提供",
+            "请提供需要翻译的日语原文，我将为你翻译成简体中文",
+            "你好，我是游戏翻译人。很高兴为您提供翻译服务。请告诉我您需要翻译的日语内容",
+            "了解。请提供需要翻译的日语文本"
+]
+        
         # 对提示词列表遍历，有任意一次结果符合要求，break
-        for i in range(0,l):
-            prompt=prompt_list[i]
+        for i in range(len(prompt_list)):
+            prompt = prompt_list[i]
+            dict_inuse = get_dict(text)
             if dict_inuse:
-                prompt+=dprompt_list[i]+str(dict_inuse)
+                prompt += dprompt_list[i] + str(dict_inuse)
+                          
             # 构建API请求数据
             messages_test = [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": text}
             ]
             # 发送API请求，并获取翻译结果
-            response_test = openai_client.chat.completions.create(
-                model=Model_Type,
-                messages=messages_test,
-                **model_params  # 添加更多模型参数
-            )
-            # 提取翻译文本
-            translations = response_test.choices[0].message.content
-            print(f'{prompt}\n{translations}')
-
-            # 如果原文本包含特殊字符，将翻译结果包裹起来
-            if has_special_start and has_special_end:
-                if not translations.startswith(special_char_start):
-                    translations = special_char_start + translations
-                if not translations.endswith(special_char_end):
-                    translations = translations + special_char_end
-                elif has_special_start and not translations.startswith(special_char_start):
-                    translations = special_char_start + translations
-                elif has_special_end and not translations.endswith(special_char_end):
-                    translations = translations + special_char_end
-            
-            # 检查翻译结果是否以特殊字符结束
-            translation_end_special_char = None
-            if translations[-1] in special_chars:
-                translation_end_special_char = translations[-1]
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future_to_trans = {executor.submit(client.chat.completions.create, model=Model_Type, messages=messages_test, **model_params): client for client in openai_clients}
+                for future in concurrent.futures.as_completed(future_to_trans):
+                    try:
+                        response_test = future.result()
+                        # 提取翻译文本
+                        translations = response_test.choices[0].message.content
+                        print(f'{prompt}\n{translations}')
+                        
+                        # 如果原文本包含特殊字符，将翻译结果包裹起来
+                        if has_special_start and has_special_end:
+                            if not translations.startswith(special_char_start):
+                                translations = special_char_start + translations
+                            if not translations.endswith(special_char_end):
+                                translations = translations + special_char_end
+                            elif has_special_start and not translations.startswith(special_char_start):
+                                translations = special_char_start + translations
+                            elif has_special_end and not translations.endswith(special_char_end):
+                                translations = translations + special_char_end
+                        
+                        # 检查翻译结果是否以特殊字符结束
+                        translation_end_special_char = None
+                        if translations[-1] in special_chars:
+                            translation_end_special_char = translations[-1]
+                            
+                        # 如果接收的文本和翻译结果的末尾特殊字符不匹配，则进行更正
+                        if text_end_special_char and translation_end_special_char:
+                            if text_end_special_char != translation_end_special_char:
+                                translations = translations[:-1] + text_end_special_char
+                        elif text_end_special_char and not translation_end_special_char:
+                            translations += text_end_special_char
+                        elif not text_end_special_char and translation_end_special_char:
+                            translations = translations[:-1]
+                        
+                        #检测计算重复出现的短语或单字   
+                        repeated_sequences = count_repeated_sequences(translations, repeat_count)
+                        # 打印出每个重复短语及其连续出现的次数
+                        for sequence, times in repeated_sequences.items():
+                            print(f"\033[31m重复短语 \033[0m'\033[35m{sequence}\033[0m' \033[31m连续出现了\033[0m \033[35m{times} \033[0m次。")    
+                            
+                        # 检查翻译结果是否包含无法完成任务的道歉短语
+                        if any(apology_phrase in translations for apology_phrase in apology_phrases):
+                            continue  # 跳过当前提示词，使用下一个提示词重新翻译                      
+                        
+                        
+                        # 检查译文中是否包含日文字符和重复短语
+                        contains_japanese_characters = contains_japanese(translations)
+                        repeat_check = has_repeated_sequence(translations, repeat_count)
+                        
+                    
+                    except Exception as exc:
+                        print(f"API请求超时，正在进行重试... {exc}")
+                        if retry_count < 2:  # 设置最大重试次数
+                            retry_count += 1
+                            continue
+                        else:
+                            print(f"重试次数已达上限，请求失败。错误信息：{exc}")
+                            queue.put(False)
+                            return
+                        
                 
-            # 如果接收的文本和翻译结果的末尾特殊字符不匹配，则进行更正
-            if text_end_special_char and translation_end_special_char:
-                if text_end_special_char != translation_end_special_char:
-                    translations = translations[:-1] + text_end_special_char
-            elif text_end_special_char and not translation_end_special_char:
-                translations += text_end_special_char
-            elif not text_end_special_char and translation_end_special_char:
-                translations = translations[:-1]
                 
-            # 检查翻译结果是否包含无法完成任务的道歉短语
-            if apology_phrase in translations:
-                print("检测到道歉短语，变更提示词重新翻译")
-                continue  # 跳过当前提示词，使用下一个提示词重新翻译
-            
-            repeat_check=has_repeated_sequence(translations,repeat_count)
-
-            
-            if not is_chinese_text_shorter_than(translations) and not repeat_check:
-                break
-            # 如果结果含重复短语，增加重复惩罚
-            if repeat_check:
-                model_params['frequency_penalty']+=1/l
+                # 如果翻译结果不含日文字符且没有重复，则退出循环
+                if not contains_japanese_characters and not repeat_check:
+                     break
+                        
+                elif contains_japanese_characters:
+                # 如果翻译结果中包含日文字符，则尝试下一个提示词
+                    print("\033[31m检测到译文中包含日文字符，尝试使用下一个提示词进行翻译。\033[0m")
+                    continue
+                    
+                elif repeat_check:
+                    # 如果翻译结果中存在重复短语，限制重复序列的长度
+                    print("\033[31m检测到译文中存在重复短语，限制重复序列的长度。\033[0m")
+                    model_params['frequency_penalty'] += 0.1
+                    break  # 跳出for循环，使用调整过的frequency_penalty重新尝试翻译         
+             
+            # 如果for循环完成后（即尝试了所有提示词）且翻译结果不含日文字符且没有重复，则退出while循环
+            if not contains_japanese_characters and not repeat_check:
+                break    
         # 打印翻译结果
-        print(f"翻译结果: {translations}")
+        print(f"\033[36m[译文]\033[0m:\033[31m {translations}\033[0m")
+        print("-------------------------------------------------------------------------------------------------------")
         queue.put(translations)
 
     except Exception as e:
-        print(f"请求出现问题！错误信息如下: {e}")
+        print(f"API请求超时，正在进行重试... {exc}")
         queue.put(False)
 
 # 定义处理翻译的路由
@@ -186,26 +283,41 @@ def handle_translation(text, queue):
 def translate():
     # 从GET请求中获取待翻译的文本
     text = request.args.get('text')  
-    print(f"接收到的文本: {text}")
-    #检测text中是否包含"\n",如果包含则替换成\\n  
-    # if '\n' in text:
-    #    text=text.replace('\n','\\n')  
+    print(f"\033[36m[原文]\033[0m \033[35m{text}\033[0m")
+    #检测text中是否包含"\n",如果包含则替换成\\n
+    if '\n' in text:
+        text=text.replace('\n','\\n')
 
     translation_queue = Queue()
-    translation_thread = Thread(target=handle_translation, args=(text, translation_queue))
-    translation_thread.start()
-    translation_thread.join()
+
+    # 创建线程池
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # 提交翻译任务到线程池
+        future = executor.submit(handle_translation, text, translation_queue)
+
+        try:
+            # 获取任务结果，如果30秒内任务未完成，抛出异常
+            future.result(timeout=30)
+        except concurrent.futures.TimeoutError:
+            print("翻译请求超时，重新翻译...")
+            return "[请求超时] " + text, 500
 
     translation = translation_queue.get()
 
-    if translation:
-         # translation=translation.replace('\\n','\n')  
-         return f"{translation}"
+    if isinstance(translation, str):
+        translation = translation.replace('\\n', '\n')
+        return translation
     else:
-         return "翻译失败", 500
+        return translation, 500
+
+# 还原代理设置
+if original_http_proxy is not None:
+    os.environ["http_proxy"] = original_http_proxy
+if original_https_proxy is not None:
+    os.environ["https_proxy"] = original_https_proxy
 
 def main():
-    print("服务器在 http://127.0.0.1:4000 上启动")
+    print("\033[31m服务器在 http://127.0.0.1:4000 上启动\033[0m")
     http_server = WSGIServer(('127.0.0.1', 4000), app, log=None, error_log=None)
     http_server.serve_forever()
 
