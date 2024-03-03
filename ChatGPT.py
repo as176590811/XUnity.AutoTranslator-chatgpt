@@ -3,11 +3,12 @@ from gevent.pywsgi import WSGIServer  #需要安装库 pip install gevent
 from urllib.parse import unquote
 from threading import Thread
 from queue import Queue
-import os
 from openai import OpenAI   #需要安装库 pip install openai
-import re
-import json
 import concurrent.futures
+import os
+import re
+import time
+import json
 
 # 启用虚拟终端序列，支持ANSI转义代码
 os.system('')
@@ -16,9 +17,9 @@ os.system('')
 dict_path='用户替换字典.json' # 提示字典路径，不使用则留空
 
 # API配置
-Base_urls = ['https://api.sweetyun.com']  # 中转请求地址
+Base_url = 'https://api.sweetkxq.top' # 中转请求地址
 Model_Type = 'gpt-3.5-turbo-16k' # 模型名称
-API_keys = ['sk-1111111111111111111111111111111111']  
+API_key = 'sk-111111111111111111111111111111111111111' 
 Proxy_port = ''  # 代理端口，如果不使用代理则为空
 
 # 如果填入地址，则设置系统代理
@@ -51,11 +52,11 @@ if Proxy_port:
     os.environ["https_proxy"] = Proxy_port
 
 # 检查一下请求地址尾部是否为/v1，自动补全
-if not Base_urls[0].endswith("/v1"):
-    Base_urls = [url + "/v1" for url in Base_urls]
+if Base_url[-3:] != "/v1":
+    Base_url = Base_url + "/v1"
 
 # 创建多个openai客户端
-openai_clients = [OpenAI(api_key=key, base_url=url) for key, url in zip(API_keys, Base_urls)]
+openai_client = OpenAI(api_key=API_key, base_url= Base_url)
 
 # 读取提示字典,并从长倒短排序
 if dict_path:
@@ -129,12 +130,23 @@ def get_dict(text):
             break
     return res
 
-
-def handle_translation(text, queue, prompt_index=0):
+request_queue = Queue()  # 创建请求队列
+def handle_translation(text, translation_queue):
     # 对接收到的文本进行URL解码
     
     text = unquote(text)
      
+    max_retries = 3  # 最大重试次数
+    
+    # 设置最大线程数的上限
+    MAX_THREADS = 30
+    
+    # 从请求队列中获取当前排队的请求数量
+    queue_length = request_queue.qsize()
+
+    # 设置线程数的基本逻辑，根据请求队列长度动态调整
+    # 举例：如果队列中有20个请求，就启用5个线程
+    number_of_threads = max(1, min(queue_length // 4, MAX_THREADS))
     
     # 定义特殊字符
     special_chars = ['，', '。', '？','...']
@@ -175,7 +187,6 @@ def handle_translation(text, queue, prompt_index=0):
             "你好，我是游戏翻译人。很高兴为您提供翻译服务。请告诉我您需要翻译的日语内容",
             "了解。请提供需要翻译的日语文本"
 ]
-        
         # 对提示词列表遍历，有任意一次结果符合要求，break
         for i in range(len(prompt_list)):
             prompt = prompt_list[i]
@@ -189,12 +200,14 @@ def handle_translation(text, queue, prompt_index=0):
                 {"role": "user", "content": text}
             ]
             # 发送API请求，并获取翻译结果
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future_to_trans = {executor.submit(client.chat.completions.create, model=Model_Type, messages=messages_test, **model_params): client for client in openai_clients}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=number_of_threads) as executor:
+                # 使用全局客户端对象生成future对象
+                future_to_trans = {executor.submit(openai_client.chat.completions.create, model=Model_Type, messages=messages_test, **model_params) for _ in range(number_of_threads)}
+                
+                # 等待所有的future完成
                 for future in concurrent.futures.as_completed(future_to_trans):
                     try:
                         response_test = future.result()
-                        # 提取翻译文本
                         translations = response_test.choices[0].message.content
                         print(f'{prompt}\n{translations}')
                         
@@ -239,15 +252,14 @@ def handle_translation(text, queue, prompt_index=0):
                         repeat_check = has_repeated_sequence(translations, repeat_count)
                         
                     
-                    except Exception as exc:
-                        print(f"API请求超时，正在进行重试... {exc}")
-                        if retry_count < 2:  # 设置最大重试次数
-                            retry_count += 1
-                            continue
-                        else:
-                            print(f"重试次数已达上限，请求失败。错误信息：{exc}")
-                            queue.put(False)
-                            return
+                    except Exception as e:
+                        retries += 1
+                        print(f"API请求超时，正在进行第 {retries} 次重试... {e}")
+                        if retries == max_retries:
+                            # 达到最大重试次数，抛出异常
+                            raise e
+                        # 可以在这里添加延时等待，然后重试
+                        time.sleep(1) # 比如等待1秒后重试
                         
                 
                 
@@ -272,11 +284,11 @@ def handle_translation(text, queue, prompt_index=0):
         # 打印翻译结果
         print(f"\033[36m[译文]\033[0m:\033[31m {translations}\033[0m")
         print("-------------------------------------------------------------------------------------------------------")
-        queue.put(translations)
+        translation_queue.put(translations)
 
     except Exception as e:
-        print(f"API请求超时，正在进行重试... {exc}")
-        queue.put(False)
+        print(f"API请求失败：{e}")
+        translation_queue.put(False)
 
 # 定义处理翻译的路由
 @app.route('/translate', methods=['GET'])  
@@ -289,6 +301,9 @@ def translate():
         text=text.replace('\n','\\n')
 
     translation_queue = Queue()
+    
+    # 将请求加入队列
+    request_queue.put_nowait(text)
 
     # 创建线程池
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -303,6 +318,9 @@ def translate():
             return "[请求超时] " + text, 500
 
     translation = translation_queue.get()
+    
+    # 任务完成后，从队列中移除请求
+    request_queue.get_nowait()
 
     if isinstance(translation, str):
         translation = translation.replace('\\n', '\n')
