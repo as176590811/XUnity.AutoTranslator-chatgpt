@@ -3,7 +3,7 @@ from gevent.pywsgi import WSGIServer  #需要安装库 pip install gevent
 from urllib.parse import unquote
 from threading import Thread
 from queue import Queue
-from openai import OpenAI   #需要安装库 pip install openai
+from openai import OpenAI   #需要安装库 pip install openai  更新pip install --upgrade openai
 import concurrent.futures
 import os
 import re
@@ -19,7 +19,7 @@ dict_path='用户替换字典.json' # 提示字典路径，不使用则留空
 # API配置
 Base_url = 'https://api.sweetkxq.top' # 中转请求地址
 Model_Type = 'gpt-3.5-turbo-16k' # 模型名称
-API_key = 'sk-111111111111111111111111111111111111111' 
+API_key = 'sk-1111111111111111111111111111111111111111' 
 Proxy_port = ''  # 代理端口，如果不使用代理则为空
 
 # 如果填入地址，则设置系统代理
@@ -95,28 +95,6 @@ def has_repeated_sequence(string, count):
             
     return False
 
-
-#检测计算重复出现的短语或单字(仅计算，不作任何作用)
-def count_repeated_sequences(string, repeat_count):
-    # 匹配连续的单词或单个字符
-    pattern = re.compile(r'(\b\w+\b|\S)(\s+\1)+')
-    
-    # 存储重复序列及其出现次数
-    repeated_sequences = {}
-
-    # 查找所有连续重复的序列
-    for match in pattern.finditer(string):
-        # 获取匹配的文本
-        matched_text = match.group(0)
-        # 获取基础单词或字符
-        base_word = match.group(1)
-        # 计算基础单词或字符重复出现的次数（加1是因为基础单词本身也算一次）
-        repeat_times = len(matched_text.split()) // (matched_text.count(base_word) // len(base_word)) + 1
-        # 如果重复次数大于等于repeat_count，则记录
-        if repeat_times >= repeat_count:
-            repeated_sequences[base_word] = repeat_times
-
-    return repeated_sequences
 
 
 # 获得文本中包含的字典词汇
@@ -235,13 +213,8 @@ def handle_translation(text, translation_queue):
                             translations += text_end_special_char
                         elif not text_end_special_char and translation_end_special_char:
                             translations = translations[:-1]
-                        
-                        #检测计算重复出现的短语或单字   
-                        repeated_sequences = count_repeated_sequences(translations, repeat_count)
-                        # 打印出每个重复短语及其连续出现的次数
-                        for sequence, times in repeated_sequences.items():
-                            print(f"\033[31m重复短语 \033[0m'\033[35m{sequence}\033[0m' \033[31m连续出现了\033[0m \033[35m{times} \033[0m次。")    
-                            
+                          
+                                                     
                         # 检查翻译结果是否包含无法完成任务的道歉短语
                         if any(apology_phrase in translations for apology_phrase in apology_phrases):
                             continue  # 跳过当前提示词，使用下一个提示词重新翻译                      
@@ -262,7 +235,6 @@ def handle_translation(text, translation_queue):
                         time.sleep(1) # 比如等待1秒后重试
                         
                 
-                
                 # 如果翻译结果不含日文字符且没有重复，则退出循环
                 if not contains_japanese_characters and not repeat_check:
                      break
@@ -273,8 +245,8 @@ def handle_translation(text, translation_queue):
                     continue
                     
                 elif repeat_check:
-                    # 如果翻译结果中存在重复短语，限制重复序列的长度
-                    print("\033[31m检测到译文中存在重复短语，限制重复序列的长度。\033[0m")
+                    # 如果翻译结果中存在重复短语，调整参数
+                    print("\033[31m检测到译文中存在重复短语，调整参数。\033[0m")
                     model_params['frequency_penalty'] += 0.1
                     break  # 跳出for循环，使用调整过的frequency_penalty重新尝试翻译         
              
